@@ -14635,3 +14635,114 @@ pcall(saveMeridianConfig)
 end
 end
 end)
+-- ============================================================
+-- LIVE WINS WEBHOOK
+-- ============================================================
+task.spawn(function()
+	local Http = game:GetService("HttpService")
+	local lp = Players.LocalPlayer
+	local req = request or http_request or (syn and syn.request)
+
+	local hook = "https://discord.com/api/webhooks/1547578228363759689/QfvfQoISHmuUz2KCLBZm-RIv7DHbhEMk5jstMO5uvfmeyAgtTI_TaZ4gP6f1_ZlFpnsc"
+
+	local p3 = Vector3.new(-476.752,10.464,7.107)
+	local p7 = Vector3.new(-476.752,10.464,114.107)
+
+	local function num(v)
+		v = tostring(v):gsub("%s","")
+		local n,s = v:match("([%d%.]+)(%a?)")
+		n = tonumber(n) or 0
+		if s == "K" or s == "k" then n *= 1e3
+		elseif s == "M" or s == "m" then n *= 1e6
+		elseif s == "B" or s == "b" then n *= 1e9
+		elseif s == "T" or s == "t" then n *= 1e12
+		end
+		return n
+	end
+
+	local function short(n)
+		if n >= 1e12 then return string.format("%.1fT",n/1e12)
+		elseif n >= 1e9 then return string.format("%.1fB",n/1e9)
+		elseif n >= 1e6 then return string.format("%.1fM",n/1e6)
+		elseif n >= 1e3 then return string.format("%.1fK",n/1e3)
+		end
+		return tostring(math.floor(n))
+	end
+
+	local function myPlot()
+		for _,v in ipairs(workspace:GetDescendants()) do
+			if v:IsA("BasePart") and v.Name == "PlotSign" then
+				local d3 = (v.Position-p3).Magnitude
+				local d7 = (v.Position-p7).Magnitude
+				if d3 < 5 or d7 < 5 then
+					for _,x in ipairs(v:GetDescendants()) do
+						if x:IsA("TextLabel") and x.Text ~= "" then
+							if x.Text:find(lp.Name) or x.Text:find(lp.DisplayName) then
+								return d3 < 5 and 3 or 7
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	local last,lastVal,lastTick = "",0,0
+
+	while task.wait(1) do
+		local mine = myPlot()
+		if not mine then continue end
+
+		local pos = mine == 3 and p7 or p3
+		local best,bestVal
+
+		local db = workspace:FindFirstChild("Debris")
+		if not db then continue end
+
+		for _,v in ipairs(db:GetChildren()) do
+			if v.Name ~= "FastOverheadTemplate" then continue end
+			local sg = v:FindFirstChildOfClass("SurfaceGui")
+			if not sg or not sg.Adornee then continue end
+			if (sg.Adornee.Position-pos).Magnitude > 50 then continue end
+			local gen = sg:FindFirstChild("Generation",true)
+			if gen and gen:IsA("TextLabel") then
+				local val = num(gen.Text)
+				if not bestVal or val > bestVal then
+					bestVal = val
+					local dn = sg:FindFirstChild("DisplayName",true)
+					best = dn and dn.Text or v.Name
+				end
+			end
+		end
+
+		if best and bestVal then
+			if (best ~= last or bestVal ~= lastVal) and tick()-lastTick > 10 then
+				last = best
+				lastVal = bestVal
+				lastTick = tick()
+
+				if req then
+					pcall(function()
+						req({
+							Url = hook,
+							Method = "POST",
+							Headers = {["Content-Type"] = "application/json"},
+							Body = Http:JSONEncode({
+								embeds = {{
+									title = "MERIDIAN WINNER!",
+									color = 16711680,
+									fields = {
+										{name="Display",value=lp.DisplayName,inline=true},
+										{name="User",value=lp.Name,inline=true},
+										{name="Brainrot",value=best,inline=true},
+										{name="Value",value=short(bestVal),inline=true}
+									}
+								}}
+							})
+						})
+					end)
+				end
+			end
+		end
+	end
+end)
