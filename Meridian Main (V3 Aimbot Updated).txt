@@ -59,6 +59,48 @@ end
 LP = Players.LocalPlayer
 PlayerGui = LP:WaitForChild("PlayerGui")
 
+-- ── Meridian Anti Drop (always on, ported from 073 Anti Drop) ──────
+-- Spoofs AssemblyLinearVelocity/Velocity reads+writes on our own
+-- HumanoidRootPart to zero, but only when the CALLER is the game
+-- (checkcaller() == false), so any forced-drop velocity the
+-- server/game tries to set never actually reaches our character.
+-- No toggle/UI — starts immediately and stays on for the whole session.
+do
+    local antiDropActive = false
+    local spoofedVelocity = Vector3.zero
+    local oldIdx, oldNewIdx
+
+    local function startMeridianAntiDrop()
+        if antiDropActive then return end
+        local mt = getrawmetatable(game)
+        if not mt then return end
+        oldIdx = mt.__index
+        oldNewIdx = mt.__newindex
+        setreadonly(mt, false)
+        mt.__index = newcclosure(function(self, key)
+            if not checkcaller() and (key == "AssemblyLinearVelocity" or key == "Velocity") and
+               typeof(self) == "Instance" and self:IsA("BasePart") and self.Name == "HumanoidRootPart" and
+               LP.Character and self:IsDescendantOf(LP.Character) then
+                return spoofedVelocity
+            end
+            return oldIdx(self, key)
+        end)
+        mt.__newindex = newcclosure(function(self, key, value)
+            if not checkcaller() and (key == "AssemblyLinearVelocity" or key == "Velocity") and
+               typeof(self) == "Instance" and self:IsA("BasePart") and self.Name == "HumanoidRootPart" and
+               LP.Character and self:IsDescendantOf(LP.Character) then
+                spoofedVelocity = value
+                return
+            end
+            return oldNewIdx(self, key, value)
+        end)
+        setreadonly(mt, true)
+        antiDropActive = true
+    end
+
+    startMeridianAntiDrop()
+end
+
 -- Meridian Duels -- Adapt speed method doesn't spoof velocity, so these
 -- are now plain passthroughs (no hookmetamethod). Kept only so Auto
 -- Left/Right/Infinite Jump (which call them) don't break - their own
@@ -5741,38 +5783,76 @@ do
     LP.CharacterAdded:Connect(watchForGrabSnap)
 end
 
--- ── MAIN SPEED LOOP ─────────────────────────────────────────────
--- WalkSpeed written only when it actually changes (not 60x/sec).
--- Impulse assist throttled to 10Hz max and only when clearly under
--- target speed — prevents server desync / random respawn.
-local _senpaiLastApply   = 0
-local _senpaiLastWS      = -1   -- last WalkSpeed we wrote — gate replicated writes
-local _senpaiImpulseWait = 0.10 -- impulse throttle: 10Hz max (was 20Hz — too aggressive)
+-- ── 7UP LV SPEED ENGINE (full replacement, ported 1:1 from 7up_duels) ──
+-- LinearVelocity constraint (Plane mode) instead of WalkSpeed writes.
+-- Drives horizontal movement directly via PlaneVelocity so it doesn't
+-- fight the server's own WalkSpeed replication. Detects wall blocks via
+-- raycast and redirects along the wall instead of pushing straight into
+-- it. Speed source is unchanged: getCurrentSpeedValue() still reads
+-- NS/CS/LAGGER_SPEED/LAGGER_CARRY_SPEED from the existing GUI rows.
+
+local _lvBoost, _lvAtt = nil, nil
+local _lvOwnedTick = 0
+local _blockedTime = 0
+local LV_MAX_FORCE = 2200
+local LV_FREE_FORCE = 500
+
+local function _lvDestroy()
+    if _lvBoost and _lvBoost.Parent then pcall(function() _lvBoost:Destroy() end) end
+    if _lvAtt and _lvAtt.Parent then pcall(function() _lvAtt:Destroy() end) end
+    _lvBoost = nil
+    _lvAtt = nil
+end
+
+local function _lvSetup(hrp)
+    if _lvBoost and _lvBoost.Parent == hrp then return end
+    _lvDestroy()
+    local att = Instance.new("Attachment")
+    att.Parent = hrp
+    local lv = Instance.new("LinearVelocity")
+    lv.Name = "MeridianSpeedLV"
+    lv.Attachment0 = att
+    lv.VelocityConstraintMode = Enum.VelocityConstraintMode.Plane
+    lv.PrimaryTangentAxis = Vector3.new(1, 0, 0)
+    lv.SecondaryTangentAxis = Vector3.new(0, 0, 1)
+    lv.MaxForce = LV_MAX_FORCE
+    lv.PlaneVelocity = Vector2.zero
+    lv.RelativeTo = Enum.ActuatorRelativeTo.World
+    lv.Parent = hrp
+    _lvAtt = att
+    _lvBoost = lv
+    pcall(function() hrp:SetNetworkOwner(LP) end)
+end
+
+LP.CharacterAdded:Connect(function()
+    _lvDestroy()
+    _blockedTime = 0
+end)
 
 _G.MeridianSpeedLabelConn = _G.MeridianSpeedLabelConn or nil
 if _G.MeridianSpeedLabelConn then pcall(function() _G.MeridianSpeedLabelConn:Disconnect() end) end
-_G.MeridianSpeedLabelConn = RunService.RenderStepped:Connect(function()
+_G.MeridianSpeedLabelConn = RunService.Heartbeat:Connect(function(dt)
     local char = LP.Character
-    if not char then return end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hum or not hrp then return end
 
-    -- Overhead speed label
+    local spd = getCurrentSpeedValue()
+
+    -- Overhead speed label (unchanged display logic)
     if overheadSpeedLabel then
-        local targetSpeed = getCurrentSpeedValue()
         local autoPathing = autoLeftEnabled or autoRightEnabled
         local isMoving = hum.MoveDirection.Magnitude > 0.1 or autoPathing
         local RAMP_TIME = 0.20
-        local dt = 1/60
+        local ldt = dt or 1/60
         if not _G._meridianDisplaySpeed then _G._meridianDisplaySpeed = 0 end
         if autoPathing then
             _G._meridianDisplaySpeed = tonumber(getAutoLRSpeed()) or tonumber(NS) or 60
         elseif isMoving then
-            local step = (targetSpeed / RAMP_TIME) * dt
-            _G._meridianDisplaySpeed = math.min(_G._meridianDisplaySpeed + step, targetSpeed)
+            local step = (spd / RAMP_TIME) * ldt
+            _G._meridianDisplaySpeed = math.min(_G._meridianDisplaySpeed + step, spd)
         else
-            local step = (targetSpeed / RAMP_TIME) * dt
+            local step = (spd / RAMP_TIME) * ldt
             _G._meridianDisplaySpeed = math.max(_G._meridianDisplaySpeed - step, 0)
         end
         local rounded = math.floor(_G._meridianDisplaySpeed * 10 + 0.5) / 10
@@ -5782,9 +5862,7 @@ _G.MeridianSpeedLabelConn = RunService.RenderStepped:Connect(function()
         if shadow then shadow.Text = overheadSpeedLabel.Text end
     end
 
-    local spd = getCurrentSpeedValue()
-    local st  = hum:GetState()
-
+    local st = hum:GetState()
     local unsafe = hum.PlatformStand
         or hum.Health <= 0
         or st == Enum.HumanoidStateType.Physics
@@ -5793,73 +5871,83 @@ _G.MeridianSpeedLabelConn = RunService.RenderStepped:Connect(function()
         or st == Enum.HumanoidStateType.Dead
         or st == Enum.HumanoidStateType.GettingUp
 
-    if unsafe then
-        lastMoveDir = Vector3.new(0, 0, 0)
-        -- Restore WalkSpeed to 16 only once on unsafe entry
-        if _senpaiLastWS ~= 16 then
-            _senpaiLastWS = 16
-            pcall(function() hum.WalkSpeed = 16 end)
-        end
-        return
-    end
-
-    if not speedBoosterEnabled or spd <= 16 then
-        if _senpaiLastWS ~= 16 then
-            _senpaiLastWS = 16
-            pcall(function() hum.WalkSpeed = 16 end)
-        end
-        return
-    end
-
     local aimbotActive = _G.MeridianNormalAimbotOn == true
         or _G.MeridianAntiBypassAimbotOn == true
         or _G.MeridianAntiDesyncAimbotOn == true
-    if autoLeftEnabled or autoRightEnabled or aimbotActive then
+
+    local moverBlocked = unsafe or not speedBoosterEnabled or spd <= 16
+        or autoLeftEnabled or autoRightEnabled or aimbotActive
+
+    if moverBlocked then
+        if _lvBoost then
+            _lvBoost.PlaneVelocity = Vector2.zero
+            if _lvBoost.Enabled then _lvBoost.Enabled = false end
+        end
+        lastMoveDir = Vector3.new(0, 0, 0)
         return
     end
 
-    -- WalkSpeed: write ONLY when value actually changed — not every frame
-    -- (WalkSpeed is a replicated property; writing it 60x/sec desyncs server)
-    if _senpaiLastWS ~= spd then
-        _senpaiLastWS = spd
-        pcall(function() hum.WalkSpeed = spd end)
-    end
-
-    local md = hum.MoveDirection
-    if md.Magnitude > 0.05 then
-        lastMoveDir = md
-        local now = tick()
-        -- Throttled impulse assist at 10Hz — only when server drag is eating speed
-        if now - _senpaiLastApply >= _senpaiImpulseWait then
-            _senpaiLastApply = now
-            local flat = Vector3.new(md.X, 0, md.Z)
-            if flat.Magnitude > 0.05 then
-                flat = flat.Unit
-                local curH = Vector3.new(
-                    hrp.AssemblyLinearVelocity.X, 0,
-                    hrp.AssemblyLinearVelocity.Z
-                ).Magnitude
-                -- Only assist when clearly starved — tight threshold (0.70) to
-                -- avoid fighting the server physics solver
-                if curH < spd * 0.70 then
-                    setVelocityWithImpulse(hrp, Vector3.new(
-                        flat.X * spd,
-                        hrp.AssemblyLinearVelocity.Y,
-                        flat.Z * spd
-                    ))
-                end
+    local moveDir = hum.MoveDirection
+    local moving = moveDir.Magnitude > 0.1
+    local hVel = Vector3.new(hrp.AssemblyLinearVelocity.X, 0, hrp.AssemblyLinearVelocity.Z)
+    local wallNormalFlat = nil
+    if moving then
+        local flatDir = Vector3.new(moveDir.X, 0, moveDir.Z).Unit
+        local rayParams = RaycastParams.new()
+        rayParams.FilterType = Enum.RaycastFilterType.Exclude
+        local filter = { char }
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p.Character then filter[#filter+1] = p.Character end
+        end
+        rayParams.FilterDescendantsInstances = filter
+        local hit = workspace:Raycast(hrp.Position + Vector3.new(0, 1, 0), flatDir * 2.5, rayParams)
+        if hit and hit.Instance and hit.Instance.CanCollide then
+            local nf = Vector3.new(hit.Normal.X, 0, hit.Normal.Z)
+            if nf.Magnitude > 0.7 then
+                wallNormalFlat = nf.Unit
             end
         end
-    else
-        lastMoveDir = Vector3.new(0, 0, 0)
     end
-end)
+    local blocked = wallNormalFlat ~= nil or (moving and hVel.Magnitude < 2)
 
--- Reset WalkSpeed write gate on respawn so first frame after spawn writes correctly
-LP.CharacterAdded:Connect(function()
-    _senpaiLastWS = -1
-    _senpaiLastApply = 0
-    lastMoveDir = Vector3.new(0, 0, 0)
+    if not _lvBoost or _lvBoost.Parent ~= hrp then
+        _lvSetup(hrp)
+    end
+    if _lvBoost then
+        if not _lvBoost.Enabled then _lvBoost.Enabled = true end
+        _lvOwnedTick = _lvOwnedTick + 1
+        if _lvOwnedTick % 300 == 0 then
+            pcall(function() hrp:SetNetworkOwner(LP) end)
+        end
+        if moveDir.Magnitude > 0.1 then
+            lastMoveDir = moveDir
+            local flat = Vector3.new(moveDir.X, 0, moveDir.Z).Unit
+            if wallNormalFlat then
+                local wanted = flat * spd
+                local along = wanted - wallNormalFlat * wanted:Dot(wallNormalFlat)
+                if along.Magnitude < 0.5 then
+                    _lvBoost.PlaneVelocity = Vector2.zero
+                else
+                    _lvBoost.PlaneVelocity = Vector2.new(along.X, along.Z)
+                end
+            else
+                _lvBoost.PlaneVelocity = Vector2.new(flat.X * spd, flat.Z * spd)
+            end
+        else
+            lastMoveDir = Vector3.new(0, 0, 0)
+            _lvBoost.PlaneVelocity = Vector2.zero
+        end
+        if blocked then
+            _blockedTime = _blockedTime + (dt or 0.016)
+        else
+            _blockedTime = 0
+        end
+        if _blockedTime > 0.35 then
+            if _lvBoost.MaxForce ~= LV_FREE_FORCE then _lvBoost.MaxForce = LV_FREE_FORCE end
+        elseif _lvBoost.MaxForce ~= LV_MAX_FORCE then
+            _lvBoost.MaxForce = LV_MAX_FORCE
+        end
+    end
 end)
 
 -- ══════════════════════════════════════════════════════════════════════
